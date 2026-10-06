@@ -27,9 +27,11 @@ Environment:
 - accelerate 0.27.2
 """
 
+import argparse
 import os
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
@@ -40,6 +42,8 @@ import torch.nn as nn
 from datasets import Dataset
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 from sklearn.utils.class_weight import compute_class_weight
+from pipeline_runtime import (ROOT, choose_device, clean_text, positive_int,
+                              require_file, sample_per_class, validate_probabilities)
 
 from transformers import (
     AutoTokenizer,
@@ -59,12 +63,12 @@ from transformers import (
 @dataclass
 class Config:
     # ---- 文件路径 ----
-    train_file: str = "train.txt"
-    valid_file: str = "valid.txt"
-    test_file: str = "test.txt"
+    train_file: str = str(ROOT / "CLUE文本数据集（情感多分类任务）_GitHub开源数据集" / "train.txt")
+    valid_file: str = str(ROOT / "CLUE文本数据集（情感多分类任务）_GitHub开源数据集" / "valid.txt")
+    test_file: str = str(ROOT / "CLUE文本数据集（情感多分类任务）_GitHub开源数据集" / "test.txt")
 
     # ---- 输出路径 ----
-    output_dir: str = r".\outputs\clue_emotion_roberta_7cls"
+    output_dir: str = str(ROOT / "outputs" / "clue_emotion_roberta_7cls")
 
     # ---- 模型 ----
     model_name: str = "hfl/chinese-roberta-wwm-ext"
@@ -113,6 +117,40 @@ CFG.label2id = {
 CFG.id2label = {v: k for k, v in CFG.label2id.items()}
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Train and evaluate the seven-class CLUE emotion model.")
+    for split in ("train", "valid", "test"):
+        parser.add_argument(f"--{split}-file", default=getattr(CFG, f"{split}_file"))
+    parser.add_argument("--output-dir", default=CFG.output_dir, help="Must be new or empty; existing models are protected.")
+    parser.add_argument("--model", default=CFG.model_name)
+    parser.add_argument("--batch-size", type=positive_int, default=CFG.per_device_train_batch_size)
+    parser.add_argument("--eval-batch-size", type=positive_int, default=CFG.per_device_eval_batch_size)
+    parser.add_argument("--max-length", type=positive_int, default=CFG.max_length)
+    parser.add_argument("--epochs", type=positive_int, default=CFG.num_train_epochs)
+    parser.add_argument("--max-steps", type=positive_int, default=-1)
+    parser.add_argument("--train-per-class", type=positive_int)
+    parser.add_argument("--eval-per-class", type=positive_int)
+    parser.add_argument("--seed", type=int, default=CFG.seed)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--precision", choices=["auto", "fp32", "fp16"], default="auto")
+    parser.add_argument("--local-files-only", action="store_true")
+    return parser.parse_args(argv)
+
+
+def configure(argv=None):
+    args = parse_args(argv)
+    device = choose_device(args.device)
+    if args.precision == "fp16" and device != "cuda":
+        raise ValueError("FP16 training requires CUDA; use --precision fp32 on CPU.")
+    cfg = replace(CFG, train_file=args.train_file, valid_file=args.valid_file, test_file=args.test_file,
+                  output_dir=str(Path(args.output_dir).expanduser().resolve()), model_name=args.model,
+                  max_length=args.max_length, num_train_epochs=args.epochs, seed=args.seed,
+                  per_device_train_batch_size=args.batch_size, per_device_eval_batch_size=args.eval_batch_size,
+                  fp16=device == "cuda" and args.precision != "fp32")
+    args.device = device
+    return cfg, args
+
+
 # =========================
 # 工具函数
 # =========================
@@ -123,7 +161,7 @@ def ensure_dir(path: str):
 
 def save_json(data: dict, path: str):
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
 
 
 def read_jsonl(file_path: str) -> pd.DataFrame:
@@ -135,13 +173,15 @@ def read_jsonl(file_path: str) -> pd.DataFrame:
     - label
     """
     rows = []
-    with open(file_path, "r", encoding="utf-8") as f:
+    with require_file(file_path).open("r", encoding="utf-8-sig") as f:
         for line_idx, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
                 obj = json.loads(line)
+                if not isinstance(obj, dict):
+                    raise ValueError(f"Expected a JSON object in {file_path}, line {line_idx}")
                 rows.append(obj)
             except json.JSONDecodeError as e:
                 raise ValueError(f"JSON decode error in {file_path}, line {line_idx}: {e}")
@@ -156,7 +196,7 @@ def validate_dataframe(df: pd.DataFrame, label2id: Dict[str, int], file_name: st
     if missing_cols:
         raise ValueError(f"{file_name} is missing required columns: {missing_cols}")
 
-    invalid_labels = sorted(set(df["label"].unique()) - set(label2id.keys()))
+    invalid_labels = sorted(str(v) for v in set(df["label"].unique()) - set(label2id.keys()))
     if invalid_labels:
         raise ValueError(f"{file_name} has invalid labels: {invalid_labels}")
 
@@ -164,8 +204,10 @@ def validate_dataframe(df: pd.DataFrame, label2id: Dict[str, int], file_name: st
 def preprocess_dataframe(df: pd.DataFrame, label2id: Dict[str, int]) -> pd.DataFrame:
     df = df.copy()
 
-    df["content"] = df["content"].astype(str).fillna("").str.strip()
+    df["content"] = clean_text(df["content"])
     df = df[df["content"] != ""].reset_index(drop=True)
+    if df.empty:
+        raise ValueError("Training/evaluation split contains no non-empty text.")
 
     df["labels"] = df["label"].map(label2id).astype(int)
     return df
@@ -192,8 +234,8 @@ def compute_metrics(eval_pred):
     preds = np.argmax(logits, axis=-1)
 
     acc = accuracy_score(labels, preds)
-    macro_f1 = f1_score(labels, preds, average="macro")
-    weighted_f1 = f1_score(labels, preds, average="weighted")
+    macro_f1 = f1_score(labels, preds, labels=list(range(7)), average="macro", zero_division=0)
+    weighted_f1 = f1_score(labels, preds, labels=list(range(7)), average="weighted", zero_division=0)
 
     return {
         "accuracy": acc,
@@ -207,6 +249,9 @@ def compute_class_weights(train_labels: List[int], num_labels: int) -> torch.Ten
     Compute balanced class weights from training labels.
     """
     class_indices = np.arange(num_labels)
+    missing = set(class_indices) - set(train_labels)
+    if missing:
+        raise ValueError(f"Training split is missing classes: {sorted(missing)}")
     weights = compute_class_weight(
         class_weight="balanced",
         classes=class_indices,
@@ -238,7 +283,9 @@ class WeightedTrainer(Trainer):
         else:
             loss_fct = nn.CrossEntropyLoss()
 
-        loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
+        loss = loss_fct(logits.float().view(-1, model.config.num_labels), labels.view(-1))
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite training loss; retry an isolated run with --precision fp32.")
 
         return (loss, outputs) if return_outputs else loss
 
@@ -258,6 +305,7 @@ def export_predictions(
     pred_output = trainer.predict(dataset)
     logits = pred_output.predictions
     probs = torch.softmax(torch.tensor(logits), dim=-1).numpy()
+    validate_probabilities(probs)
     pred_ids = probs.argmax(axis=1)
     pred_scores = probs.max(axis=1)
 
@@ -277,7 +325,9 @@ def export_predictions(
     report = classification_report(
         original_df["labels"].values,
         pred_ids,
+        labels=list(range(len(id2label))),
         target_names=[id2label[i] for i in range(len(id2label))],
+        zero_division=0,
         digits=4,
         output_dict=True
     )
@@ -288,12 +338,15 @@ def export_predictions(
 # 主程序
 # =========================
 
-def main():
+def main(argv=None):
+    CFG, args = configure(argv)
     print("=" * 90)
     print("CLUE Emotion 7-class Fine-tuning Started")
     print("=" * 90)
 
-    ensure_dir(CFG.output_dir)
+    output_path = Path(CFG.output_dir)
+    if output_path.exists() and any(output_path.iterdir()):
+        raise FileExistsError(f"Training output directory is not empty: {output_path}; choose a new --output-dir.")
     set_seed(CFG.seed)
 
     # 1. 读取数据
@@ -309,6 +362,10 @@ def main():
     train_df = preprocess_dataframe(train_df, CFG.label2id)
     valid_df = preprocess_dataframe(valid_df, CFG.label2id)
     test_df = preprocess_dataframe(test_df, CFG.label2id)
+    train_df = sample_per_class(train_df, args.train_per_class, CFG.seed)
+    valid_df = sample_per_class(valid_df, args.eval_per_class, CFG.seed)
+    test_df = sample_per_class(test_df, args.eval_per_class, CFG.seed)
+    ensure_dir(CFG.output_dir)
 
     print(f"Train size: {len(train_df):,}")
     print(f"Valid size: {len(valid_df):,}")
@@ -329,7 +386,7 @@ def main():
 
     # 3. tokenizer & dataset
     print("\n[Step 3] Building tokenizer and datasets...")
-    tokenizer = AutoTokenizer.from_pretrained(CFG.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(CFG.model_name, local_files_only=args.local_files_only)
 
     train_ds = build_hf_dataset(train_df)
     valid_ds = build_hf_dataset(valid_df)
@@ -362,14 +419,19 @@ def main():
         CFG.model_name,
         num_labels=CFG.num_labels,
         label2id=CFG.label2id,
-        id2label=CFG.id2label
+        id2label=CFG.id2label,
+        local_files_only=args.local_files_only,
     )
+    if CFG.max_length > model.config.max_position_embeddings:
+        raise ValueError("--max-length exceeds model positional capacity.")
 
     # 5. 训练参数
     print("\n[Step 5] Preparing training arguments...")
     training_args = TrainingArguments(
         output_dir=CFG.output_dir,
-        overwrite_output_dir=True,
+        overwrite_output_dir=False,
+        max_steps=args.max_steps,
+        use_cpu=args.device == "cpu",
 
         num_train_epochs=CFG.num_train_epochs,
         learning_rate=CFG.learning_rate,
@@ -380,14 +442,17 @@ def main():
         per_device_eval_batch_size=CFG.per_device_eval_batch_size,
         gradient_accumulation_steps=CFG.gradient_accumulation_steps,
 
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
+        evaluation_strategy="steps" if args.max_steps > 0 else "epoch",
+        save_strategy="steps" if args.max_steps > 0 else "epoch",
+        eval_steps=args.max_steps if args.max_steps > 0 else None,
+        save_steps=args.max_steps if args.max_steps > 0 else 500,
         load_best_model_at_end=True,
         metric_for_best_model=CFG.metric_for_best_model,
         greater_is_better=CFG.greater_is_better,
         save_total_limit=CFG.save_total_limit,
 
-        logging_steps=CFG.logging_steps,
+        logging_steps=1 if args.max_steps > 0 else CFG.logging_steps,
+        logging_nan_inf_filter=False,
         seed=CFG.seed,
 
         fp16=CFG.fp16,
@@ -465,6 +530,12 @@ def main():
     # 12. 训练摘要
     summary = {
         "model_name": CFG.model_name,
+        "seed": CFG.seed,
+        "device": args.device,
+        "fp16": CFG.fp16,
+        "max_steps": args.max_steps,
+        "global_step": trainer.state.global_step,
+        "smoke_test_only": args.max_steps > 0 or args.train_per_class is not None,
         "train_size": int(len(train_df)),
         "valid_size": int(len(valid_df)),
         "test_size": int(len(test_df)),

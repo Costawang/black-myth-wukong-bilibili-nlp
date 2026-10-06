@@ -1,3 +1,4 @@
+import argparse
 import math
 from typing import Dict, List
 
@@ -5,6 +6,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from pipeline_runtime import ROOT, choose_device, positive_int, prepare_output, read_csv, validate_probabilities
 
 # =========================
 # 基本配置
@@ -51,25 +53,30 @@ def normalise_label(label: str) -> str:
 
 
 def build_label_mapping(id2label: Dict[int, str]) -> Dict[int, str]:
-    mapping = {}
-    for idx, raw_label in id2label.items():
-        lab = normalise_label(raw_label)
-
-        if any(k in lab for k in ["pos", "positive", "好", "满意", "1"]):
-            mapping[idx] = "positive"
-        elif any(k in lab for k in ["neg", "negative", "差", "不满意", "0"]):
-            mapping[idx] = "negative"
-        else:
-            mapping[idx] = raw_label
-
-    mapped_values = set(mapping.values())
-    if "positive" not in mapped_values or "negative" not in mapped_values:
-        if len(id2label) == 2:
-            sorted_ids = sorted(id2label.keys())
-            mapping[sorted_ids[0]] = "negative"
-            mapping[sorted_ids[1]] = "positive"
-
+    aliases = {
+        "negative": {"negative", "neg", "差", "不满意", "负面"},
+        "positive": {"positive", "pos", "好", "满意", "正面"},
+    }
+    mapping = {int(idx): next((name for name, labels in aliases.items() if normalise_label(raw) in labels), None)
+               for idx, raw in id2label.items()}
+    if set(mapping) != {0, 1} or set(mapping.values()) != {"negative", "positive"}:
+        raise ValueError(f"Ambiguous binary label mapping: {id2label}; explicit positive/negative model labels are required.")
     return mapping
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Binary sentiment inference; UTF-8-SIG output.")
+    parser.add_argument("--input", default=str(ROOT / INPUT_FILE))
+    parser.add_argument("--output", default=str(ROOT / "runs" / OUTPUT_FILE))
+    parser.add_argument("--model", default=MODEL_NAME)
+    parser.add_argument("--encoding", default="utf-8-sig")
+    parser.add_argument("--batch-size", type=positive_int, default=BATCH_SIZE)
+    parser.add_argument("--max-length", type=positive_int, default=MAX_LENGTH)
+    parser.add_argument("--sample-size", type=positive_int)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--local-files-only", action="store_true")
+    return parser.parse_args(argv)
 
 
 def print_gpu_status(prefix: str = ""):
@@ -89,7 +96,17 @@ def print_gpu_status(prefix: str = ""):
 # =========================
 # 主逻辑
 # =========================
-def main():
+def main(argv=None):
+    args = parse_args(argv)
+    DEVICE = choose_device(args.device)
+    BATCH_SIZE = args.batch_size
+    required_cols = {"comment_date", "comment_text", "like_count", "reply_count"}
+    df = read_csv(args.input, args.encoding, required_cols)
+    if args.sample_size is not None:
+        df = df.sample(n=min(args.sample_size, len(df)), random_state=args.seed).reset_index(drop=True)
+    if df.empty:
+        raise ValueError("Input CSV contains no comments.")
+    output_file = prepare_output(args.output, [args.input])
     print(f"Using device: {DEVICE}")
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
@@ -97,10 +114,12 @@ def main():
         print_gpu_status("[Before loading model] ")
 
     print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=args.local_files_only)
 
     print("Loading model...")
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+    model = AutoModelForSequenceClassification.from_pretrained(args.model, local_files_only=args.local_files_only)
+    if args.max_length > model.config.max_position_embeddings:
+        raise ValueError("--max-length exceeds model positional capacity.")
     model.to(DEVICE)
     model.eval()
 
@@ -116,19 +135,7 @@ def main():
     label_mapping = build_label_mapping(id2label)
     print("Mapped labels:", label_mapping)
 
-    print("Loading CSV...")
-    df = pd.read_csv(INPUT_FILE, encoding="utf-8-sig")
-
-    required_cols = {"comment_date", "comment_text", "like_count", "reply_count"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise ValueError(f"输入文件缺少必要字段：{missing}")
-
-    if SAMPLE_SIZE is not None:
-        df = df.head(SAMPLE_SIZE).copy()
-        print(f"Running on sample size: {len(df)}")
-    else:
-        print(f"Running on full size: {len(df)}")
+    print(f"Running on {len(df)} comments; batch size {BATCH_SIZE}")
 
     texts = df[TEXT_COL].fillna("").astype(str).tolist()
 
@@ -149,7 +156,7 @@ def main():
                 batch_texts,
                 padding=True,
                 truncation=True,
-                max_length=MAX_LENGTH,
+                max_length=args.max_length,
                 return_tensors="pt",
             )
 
@@ -157,6 +164,7 @@ def main():
 
             outputs = model(**inputs)
             probs = torch.softmax(outputs.logits, dim=-1).detach().cpu()
+            validate_probabilities(probs.numpy())
 
             for row_probs in probs:
                 row_probs = row_probs.tolist()
@@ -198,8 +206,8 @@ def main():
     out_df["confidence_band"] = confidence_bands
     out_df["is_high_confidence"] = is_high_confidence_list
 
-    out_df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
-    print(f"Saved to: {OUTPUT_FILE}")
+    out_df.to_csv(output_file, index=False, encoding="utf-8-sig")
+    print(f"Saved to: {output_file}")
 
     print("\nPrediction summary:")
     print(out_df["pred_label"].value_counts(dropna=False))
