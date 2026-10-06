@@ -72,7 +72,7 @@ CLUE JSONL splits
 - Training controls: class-weighted cross-entropy, early stopping, fixed random seed, and FP16 GPU training
 - Evaluation implemented in code: accuracy, macro F1, weighted F1, and per-class classification reports
 
-The training script records an environment of Python 3.11, PyTorch 2.11.0 with CUDA, Transformers 4.37.2, Datasets 2.18.0, and Accelerate 0.27.2. The included `requirements.txt` lists dependencies without forcing versions that were not independently verified from an exported environment.
+The runtime was checked on Windows with Python 3.11.9, PyTorch 2.11.0+cu128, Transformers 4.37.2, Datasets 2.18.0, and Accelerate 0.27.2. `requirements.txt` pins the direct dependencies; `requirements-lock-windows-cu128.txt` records the installed transitive dependency closure for the tested Windows/CUDA environment. See the [runtime validation report](docs/runtime-validation-2026-10-06.md) for coverage and limitations.
 
 ## Key packaged results
 
@@ -105,7 +105,12 @@ No saved training summary or classification report was included in the archive, 
 .
 ├── README.md
 ├── requirements.txt
+├── requirements-lock-windows-cu128.txt
 ├── .gitignore
+├── pipeline_runtime.py
+├── scripts/smoke_test.py
+├── tests/test_pipeline.py
+├── docs/runtime-validation-2026-10-06.md
 ├── RoBERTa模型训练_FP16.py
 ├── 情感二分类正负推理.py
 ├── 用于情感多分类推理任务的训练后的RoBERTa模型.py
@@ -118,22 +123,60 @@ No saved training summary or classification report was included in the archive, 
 
 ## Reproducibility and usage
 
-Create an isolated environment and install the declared dependencies:
+Run the following from the repository root in PowerShell to prepare the tested Windows/CUDA package versions:
 
-```bash
-python -m venv .venv
-# Windows PowerShell
+```powershell
+py -3.11 -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install torch==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements-lock-windows-cu128.txt
+python -m pip check
 ```
 
-The scripts use paths relative to the process working directory. Review their configuration blocks before execution.
+This lock describes an existing environment that passed the tests; a clean installation was not performed during validation. CPU execution is supported by the same CUDA-enabled wheel. For other platforms, `requirements.txt` pins direct dependencies only; those platforms and alternative dependency versions have not been validated.
 
-1. `RoBERTa模型训练_FP16.py` trains the seven-class classifier. Point `train_file`, `valid_file`, and `test_file` to the included CLUE split directory, or run it from a directory containing those files.
-2. `情感二分类正负推理.py` expects `blackmyth_cleaned_round1.csv`, which is not included, and writes `blackmyth_sentiment_110m_full_output.csv`.
-3. `用于情感多分类推理任务的训练后的RoBERTa模型.py` expects the binary output and a trained model under `outputs/clue_emotion_roberta_7cls`.
+All three scripts accept `--help`. Default paths are anchored to the repository, independent of the current working directory. Explicit relative CLI paths are resolved against the caller's working directory; use absolute paths for external data and models. No source edits are needed to select inputs or batch sizes.
 
-The archive provides the three scripts, CLUE data splits, and consolidated final CSV. It does not include the raw Bilibili input, intermediate binary result, trained model checkpoint, or evaluation artifacts. Full end-to-end reruns require those missing inputs or regeneration of the model checkpoint.
+### Train and save a seven-class model
+
+The default input paths point to the bundled CLUE splits. This command performs a **five-step smoke test**, not a full research training run:
+
+```powershell
+python "RoBERTa模型训练_FP16.py" --output-dir runs/manual-smoke-model --train-per-class 16 --eval-per-class 4 --max-steps 5 --batch-size 8 --eval-batch-size 8 --device cuda --seed 42
+```
+
+The output directory must be new or empty. It receives model/tokenizer files, label mappings, validation/test predictions and classification reports, and `training_summary.json`. The smoke sample contains 112 training rows and 28 rows in each evaluation split. Its metrics are not evidence of model quality.
+
+For full training, omit `--train-per-class`, `--eval-per-class`, and `--max-steps`; the existing five-epoch, class-weighted training recipe remains the default. Use `--train-file`, `--valid-file`, and `--test-file` to override the bundled data, and `--model` to select a cached model directory or Hugging Face model ID. `--device cpu` disables FP16; `--precision fp32` is also available. Full retraining was not part of this validation.
+
+### Run the two-stage inference chain
+
+Supply a local cleaned CSV containing `comment_date`, `comment_text`, `like_count`, and `reply_count`. The original cleaned input and trained weights are **not distributed in this repository**. The packaged final CSV is historical output, not an independent raw input for reproducing the study.
+
+```powershell
+python "情感二分类正负推理.py" --input "D:\data\blackmyth_cleaned_round1.csv" --output runs/manual/binary.csv --sample-size 200 --seed 42 --batch-size 8 --device cuda
+python "用于情感多分类推理任务的训练后的RoBERTa模型.py" --input runs/manual/binary.csv --model "D:\models\clue_emotion_roberta_7cls" --output-dir runs/manual/emotion --batch-size 8 --device cuda
+```
+
+Use a trained model you already have, or `runs/manual-smoke-model` to check the short-trained model's save/load path. The emotion command writes `blackmyth_clue_emotion_highconf_output.csv`, `blackmyth_clue_emotion_distribution.csv`, and `blackmyth_clue_positive_summary.json`. The confidence threshold stays at **0.80**, and positive emotions remain `like`, `happiness`, and `surprise`.
+
+New CSV outputs and default inputs consistently use **UTF-8-SIG**. Add `--encoding gb18030` only when reading a known legacy GB18030 file; do not use it for newly generated binary output. Empty/missing inputs, invalid flags, conflicting model label mappings and a pool with no high-confidence non-empty comments produce explicit errors. Unknown binary label semantics are rejected instead of guessing their order. Inference writes its requested output paths, so choose a separate output directory for each experiment.
+
+### Automated regression and real-model smoke checks
+
+```powershell
+# Synthetic regression tests: no model download or private data needed.
+python -m unittest discover -s tests -v
+
+# Real GPU training and GPU/CPU inference; requires local input and a trained model.
+python scripts/smoke_test.py --input "D:\data\blackmyth_cleaned_round1.csv" --existing-model "D:\models\clue_emotion_roberta_7cls" --run-dir runs/smoke-check --local-files-only
+```
+
+`--run-dir` must not already exist. The runner samples 200 comments with seed 42 using only the four original input fields, performs five training steps, checks both new and existing emotion models, runs two CPU comments and one synthetic long-text example, and validates probabilities, labels, row alignment and summaries. It runs scripts from a different working directory to test path handling. GPU batch size starts at 8 and retries 4, 2, then 1 only on out-of-memory errors. Other failures stop with a saved log and failure status.
+
+The runner writes local logs and `run_report.json`, including exact commands, versions, code fingerprints and elapsed times. These local files contain paths and sample data and are ignored by Git; publish only a sanitized summary. Models, checkpoints and caches are also ignored. `--local-files-only` requires cached base/binary models; omit it to allow downloading those public models, or specify local directories with `--base-model` and `--binary-model`. No comments are sent to a remote inference service.
+
+The 2026-10-06 check passed the full small-sample chain, but did not rerun all comments or reproduce the historical research metrics. See the [validation report](docs/runtime-validation-2026-10-06.md).
 
 ## Research context
 

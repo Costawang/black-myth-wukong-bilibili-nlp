@@ -30,6 +30,7 @@ Added columns:
 - is_positive_emotion_3cls
 """
 
+import argparse
 import os
 import json
 from dataclasses import dataclass
@@ -41,6 +42,9 @@ import torch
 from tqdm import tqdm
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from pipeline_runtime import (ROOT, choose_device, clean_text, filter_high_confidence,
+                              positive_int, prepare_output, read_csv,
+                              validate_emotion_mapping, validate_probabilities)
 
 
 # =========================
@@ -78,7 +82,7 @@ CFG.positive_3cls = ["like", "happiness", "surprise"]
 # 工具函数
 # =========================
 
-def load_label_mapping(model_dir: str):
+def load_label_mapping(model_dir: str, config=None):
     """
     Load label mapping from saved model directory.
     """
@@ -89,20 +93,11 @@ def load_label_mapping(model_dir: str):
             data = json.load(f)
         label2id = data["label2id"]
         id2label = {int(k): v for k, v in data["id2label"].items()}
+    elif config is not None:
+        label2id, id2label = config.label2id, config.id2label
     else:
-        # fallback
-        label2id = {
-            "sadness": 0,
-            "happiness": 1,
-            "disgust": 2,
-            "anger": 3,
-            "like": 4,
-            "surprise": 5,
-            "fear": 6
-        }
-        id2label = {v: k for k, v in label2id.items()}
-
-    return label2id, id2label
+        raise FileNotFoundError(f"Missing label_mapping.json in {model_dir}; no model config provided.")
+    return validate_emotion_mapping(label2id, id2label, config)
 
 
 def check_required_columns(df: pd.DataFrame, required_columns: List[str]):
@@ -112,7 +107,7 @@ def check_required_columns(df: pd.DataFrame, required_columns: List[str]):
 
 
 def clean_text_series(series: pd.Series) -> pd.Series:
-    return series.astype(str).fillna("").str.strip()
+    return clean_text(series)
 
 
 def predict_batch(texts, tokenizer, model, device, max_length: int):
@@ -130,6 +125,7 @@ def predict_batch(texts, tokenizer, model, device, max_length: int):
         logits = outputs.logits
 
     probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+    validate_probabilities(probs)
     pred_ids = probs.argmax(axis=1)
     pred_scores = probs.max(axis=1)
 
@@ -147,40 +143,52 @@ def build_distribution_table(df: pd.DataFrame, emotion_col: str) -> pd.DataFrame
 # 主程序
 # =========================
 
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Seven-class inference from binary sentiment output.")
+    parser.add_argument("--input", default=str(ROOT / "runs" / "blackmyth_sentiment_110m_full_output.csv"))
+    parser.add_argument("--model", default=str(ROOT / "outputs" / "clue_emotion_roberta_7cls"))
+    parser.add_argument("--output-dir", default=str(ROOT / "runs" / "emotion"))
+    parser.add_argument("--encoding", default="utf-8-sig")
+    parser.add_argument("--batch-size", type=positive_int, default=CFG.batch_size)
+    parser.add_argument("--max-length", type=positive_int, default=CFG.max_length)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    device = torch.device(choose_device(args.device))
+    df = read_csv(args.input, args.encoding, [CFG.text_column, CFG.high_conf_column])
+    highconf_df = filter_high_confidence(df, CFG.text_column, CFG.high_conf_column)
+    model_dir = os.path.abspath(os.path.expanduser(args.model))
+    if not os.path.isfile(os.path.join(model_dir, "config.json")):
+        raise FileNotFoundError(f"Trained model config not found: {model_dir}")
+    output_csv = prepare_output(os.path.join(args.output_dir, CFG.output_csv), [args.input])
+    distribution_csv = prepare_output(os.path.join(args.output_dir, CFG.distribution_csv), [args.input])
+    summary_json = prepare_output(os.path.join(args.output_dir, CFG.summary_json), [args.input])
     print("=" * 90)
     print("Black Myth CLUE Emotion Inference Started")
     print("=" * 90)
 
     # 1. 加载模型与 tokenizer
     print("\n[Step 1] Loading model and tokenizer...")
-    label2id, id2label = load_label_mapping(CFG.model_dir)
-
-    tokenizer = AutoTokenizer.from_pretrained(CFG.model_dir)
-    model = AutoModelForSequenceClassification.from_pretrained(CFG.model_dir)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+    model = AutoModelForSequenceClassification.from_pretrained(model_dir, local_files_only=True)
+    label2id, id2label = load_label_mapping(model_dir, model.config)
+    if args.max_length > model.config.max_position_embeddings:
+        raise ValueError("--max-length exceeds model positional capacity.")
     model.to(device)
     model.eval()
 
     print(f"Device: {device}")
-    print(f"Model dir: {CFG.model_dir}")
+    print(f"Model dir: {model_dir}")
 
     # 2. 读取 CSV
     print("\n[Step 2] Loading input CSV...")
-    df = pd.read_csv(CFG.input_csv, encoding="gb18030")
-    check_required_columns(df, [CFG.text_column, CFG.high_conf_column])
-
     print(f"Original rows: {len(df):,}")
 
     # 3. 保留高置信评论
     print("\n[Step 3] Filtering high-confidence rows...")
-    df = df.copy()
-    df[CFG.text_column] = clean_text_series(df[CFG.text_column])
-
-    highconf_df = df[df[CFG.high_conf_column] == 1].copy()
-    highconf_df = highconf_df[highconf_df[CFG.text_column] != ""].reset_index(drop=True)
-
     print(f"High-confidence rows kept: {len(highconf_df):,}")
 
     if len(highconf_df) == 0:
@@ -194,14 +202,14 @@ def main():
     all_pred_scores = []
     all_probs = []
 
-    for start_idx in tqdm(range(0, len(texts), CFG.batch_size), desc="Infer"):
-        batch_texts = texts[start_idx:start_idx + CFG.batch_size]
+    for start_idx in tqdm(range(0, len(texts), args.batch_size), desc="Infer"):
+        batch_texts = texts[start_idx:start_idx + args.batch_size]
         pred_ids, pred_scores, probs = predict_batch(
             batch_texts,
             tokenizer=tokenizer,
             model=model,
             device=device,
-            max_length=CFG.max_length
+            max_length=args.max_length
         )
         all_pred_ids.extend(pred_ids.tolist())
         all_pred_scores.extend(pred_scores.tolist())
@@ -233,12 +241,12 @@ def main():
 
     # 6. 保存主结果
     print("\n[Step 6] Saving main output CSV...")
-    highconf_df.to_csv(CFG.output_csv, index=False, encoding="utf-8-sig")
+    highconf_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
 
     # 7. 七类分布统计
     print("\n[Step 7] Building emotion distribution table...")
     dist_df = build_distribution_table(highconf_df, "emotion_label")
-    dist_df.to_csv(CFG.distribution_csv, index=False, encoding="utf-8-sig")
+    dist_df.to_csv(distribution_csv, index=False, encoding="utf-8-sig")
 
     # 8. 正向三类统计
     print("\n[Step 8] Building positive-3-class summary...")
@@ -255,9 +263,9 @@ def main():
     full_distribution = highconf_df["emotion_label"].value_counts(dropna=False).to_dict()
 
     summary = {
-        "input_csv": CFG.input_csv,
-        "output_csv": CFG.output_csv,
-        "model_dir": CFG.model_dir,
+        "input_csv": os.path.abspath(args.input),
+        "output_csv": str(output_csv),
+        "model_dir": model_dir,
         "total_high_confidence_comments": total_rows,
         "positive_3cls_definition": CFG.positive_3cls,
         "positive_3cls_count": positive_rows,
@@ -267,15 +275,15 @@ def main():
         "full_emotion_distribution": full_distribution
     }
 
-    with open(CFG.summary_json, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    with open(summary_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2, allow_nan=False)
 
     # 9. 打印结果
     print("\n" + "=" * 90)
     print("Inference finished successfully.")
-    print(f"Main output saved to: {CFG.output_csv}")
-    print(f"Distribution table saved to: {CFG.distribution_csv}")
-    print(f"Summary saved to: {CFG.summary_json}")
+    print(f"Main output saved to: {output_csv}")
+    print(f"Distribution table saved to: {distribution_csv}")
+    print(f"Summary saved to: {summary_json}")
     print("\nEmotion distribution:")
     print(dist_df)
     print("\nPositive 3-class summary:")

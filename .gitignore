@@ -32,3 +32,11 @@ Thumbs.db
 *.log
 *.tmp
 ~$*
+
+# Local model weights, experimental outputs and smoke-test inputs
+outputs/
+runs/
+.cache/
+*.safetensors
+*.bin
+checkpoint-*/
